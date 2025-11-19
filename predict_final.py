@@ -1,63 +1,148 @@
 import argparse
 import os
 import re
+import pandas as pd
+import joblib
+import numpy as np
+import warnings
 
-# friendly imports with actionable error messages
+# silence sklearn version mismatch warnings (optional)
 try:
-    import pandas as pd
-    import joblib
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(f"{e}. Install project dependencies with: python -m pip install -r requirements_final.txt") from e
+    from sklearn.exceptions import InconsistentVersionWarning
+    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+except Exception:
+    pass
 
 
-def predict(csv_in: str, model_path: str, csv_out: str = None):
+def numeric_extract(val):
+    """Extract digits/decimals from any messy string."""
+    if pd.isna(val):
+        return None
+    val = str(val)
+    val = val.replace(",", "")  # remove commas
+    match = re.search(r"(\d+\.?\d*)", val)
+    return float(match.group(1)) if match else None
+
+
+def preprocess_df(df: pd.DataFrame, pipeline=None):
+    """Mirror training-time preprocessing.
+
+    If a fitted pipeline is provided, ensure all original training columns exist.
+    Missing numeric columns -> 0, missing categorical -> 'missing'.
+    """
+    col_map = {
+        "model_year": "year",
+        "milage": "mileage_km",
+        "mileage": "mileage_km",
+        "fuel_type": "fuel",
+    }
+    df = df.rename(columns=col_map)
+
+    # PRICE (if present)
+    if "price" in df.columns:
+        df["price"] = df["price"].apply(numeric_extract)
+        df = df.dropna(subset=["price"])
+
+    # MILEAGE
+    if "mileage_km" in df.columns:
+        df["mileage_km"] = df["mileage_km"].apply(numeric_extract)
+
+    # ENGINE
+    if "engine" in df.columns:
+        df["engine_cc"] = df["engine"].apply(numeric_extract)
+        # horsepower extraction patterns
+        hp = df["engine"].astype(str).str.extract(r"(\d+\.?\d*)\s*HP", expand=False)
+        hp = hp.fillna(df["engine"].astype(str).str.extract(r"^(\d+\.?\d*)", expand=False))
+        df["hp"] = pd.to_numeric(hp, errors="coerce")
+        df = df.drop(columns=["engine"], errors="ignore")
+
+    # YEAR + CAR AGE
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        df["car_age"] = pd.Timestamp.now().year - df["year"]
+
+    # Frequency encodings using dataset-level counts (best-effort; if full df not provided may underperform)
+    if "brand" in df.columns:
+        counts = df["brand"].value_counts()
+        df["brand_freq"] = df["brand"].map(counts).fillna(0)
+    if "model" in df.columns:
+        counts = df["model"].value_counts()
+        df["model_freq"] = df["model"].map(counts).fillna(0)
+
+    # Accident / clean title flags
+    if "accident" in df.columns:
+        df["accident_flag"] = (~df["accident"].astype(str).str.contains("none", case=False, na=False)).astype(int)
+    if "clean_title" in df.columns:
+        df["clean_title_flag"] = df["clean_title"].astype(str).str.lower().eq("yes").astype(int)
+
+    # drop irrelevant columns
+    drop_cols = [c for c in ["name", "year", "brand", "model"] if c in df.columns]
+    df = df.drop(columns=drop_cols, errors="ignore")
+
+    # If pipeline provided, align columns
+    if pipeline is not None and hasattr(pipeline, "named_steps") and "preprocess" in pipeline.named_steps:
+        try:
+            original_cols = list(pipeline.named_steps["preprocess"].feature_names_in_)
+            # Determine numeric vs categorical from fitted ColumnTransformer
+            ct = pipeline.named_steps["preprocess"]
+            numeric_cols = set()
+            categorical_cols = set()
+            for name, trans, cols in ct.transformers_:
+                if name == "num":
+                    numeric_cols.update(cols)
+                elif name == "cat":
+                    categorical_cols.update(cols)
+            for col in original_cols:
+                if col not in df:
+                    if col in numeric_cols:
+                        df[col] = 0
+                    elif col in categorical_cols:
+                        df[col] = "missing"
+                    else:
+                        df[col] = 0
+            # Reorder
+            df = df[original_cols]
+        except Exception:
+            pass
+
+    return df
+
+
+def predict(csv_in, model_path, csv_out=None):
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f'Model file not found: {model_path}')
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    # Load pipeline
     pipeline = joblib.load(model_path)
+
     df = pd.read_csv(csv_in)
-    # Apply the same preprocessing used during training so pipeline columns match
-    def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
-        # accept both common spellings 'mileage' and the typo 'milage'
-        col_map_actual = {'model_year': 'year', 'milage': 'mileage_km', 'mileage': 'mileage_km', 'fuel_type': 'fuel'}
-        df = df.rename(columns=col_map_actual)
+    X = preprocess_df(df.copy(), pipeline=pipeline)
 
-        if 'price' in df.columns:
-            df['price'] = df['price'].astype(str).str.extract(r'(\d+\.?\d*)', expand=False)
-            df['price'] = pd.to_numeric(df['price'], errors='coerce')
-            df = df.dropna(subset=['price'])
+    # Predict with heuristic to detect log-target vs raw-target training
+    raw_preds = pipeline.predict(X)
+    # If values look like log1p range (<20), invert; else assume already raw prices
+    if np.nanmax(raw_preds) < 20:
+        df["predicted_price"] = np.expm1(raw_preds)
+        scale_msg = "(interpreted as log1p scale; applied expm1)"
+    else:
+        df["predicted_price"] = raw_preds
+        scale_msg = "(interpreted as raw price; no inverse transform)"
 
-        if 'mileage_km' in df.columns:
-            df['mileage_km'] = df['mileage_km'].astype(str).str.extract(r'(\d+\.?\d*)', expand=False)
-            df['mileage_km'] = pd.to_numeric(df['mileage_km'], errors='coerce')
-
-        if 'engine' in df.columns:
-            df['engine_cc'] = df['engine'].astype(str).str.extract(r'(\d+\.?\d*)', expand=False)
-            df['engine_cc'] = pd.to_numeric(df['engine_cc'], errors='coerce')
-            df = df.drop(columns=['engine'], errors='ignore')
-
-        if 'year' in df.columns:
-            df['year'] = pd.to_numeric(df['year'], errors='coerce')
-            df['car_age'] = pd.Timestamp.now().year - df['year']
-
-        df = df.drop(columns=[c for c in ['name', 'year'] if c in df.columns], errors='ignore')
-        return df
-
-    X = preprocess_df(df.copy())
-    preds = pipeline.predict(X)
-    df['predicted_price'] = preds
-    out = csv_out or os.path.splitext(csv_in)[0] + '_predictions.csv'
+    out = csv_out or os.path.splitext(csv_in)[0] + "_predictions.csv"
     df.to_csv(out, index=False)
-    print(f'Predictions saved to: {out}')
+
+    print(f"\n✨ Predictions saved to: {out}\n")
+    print(df[["predicted_price"]].head())
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Make predictions with saved car price pipeline')
-    parser.add_argument('--csv', required=True, help='Input CSV with features (no price required)')
-    parser.add_argument('--model', default='car_price_pipeline.joblib', help='Path to saved pipeline')
-    parser.add_argument('--out', default=None, help='Path to output CSV with predictions')
+    parser = argparse.ArgumentParser(description="Car price prediction tool")
+    parser.add_argument("--csv", required=True, help="Input CSV file")
+    parser.add_argument("--model", default="car_price_pipeline.joblib", help="Saved pipeline path")
+    parser.add_argument("--out", help="Output CSV path")
     args = parser.parse_args()
     predict(args.csv, args.model, args.out)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
