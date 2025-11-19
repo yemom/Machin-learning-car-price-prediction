@@ -11,7 +11,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor, StackingRegressor
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 
 
@@ -207,7 +207,7 @@ def train_and_save(
     no_kaggle: bool = False,
     target: str = "price",
     auto_fallback: bool = True,
-    model_choice: str = "rf",  # rf | linear | ridge | lasso | auto
+    model_choice: str = "rf",  # rf | linear | ridge | lasso | hgb | stack | auto
 ):
     df = load_data(csv, try_kaggle=not no_kaggle)
     original_df = df.copy()
@@ -301,13 +301,43 @@ def train_and_save(
             {"model__alpha": [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]},
         )
         candidates.append(("lasso", est, params, cv_score))
+    elif choice == "hgb":
+        est, params, cv_score = fit_with(
+            HistGradientBoostingRegressor(random_state=42),
+            {
+                "model__learning_rate": [0.05, 0.07],
+                "model__max_depth": [None, 8],
+                "model__max_iter": [300, 400],
+            },
+        )
+        candidates.append(("hgb", est, params, cv_score))
+    elif choice == "stack":
+        # Build stacking without grid search (already expensive). Base learners use sensible defaults.
+        stacking = StackingRegressor(
+            estimators=[
+                ("rf", RandomForestRegressor(n_estimators=350, random_state=42, n_jobs=-1)),
+                ("hgb", HistGradientBoostingRegressor(random_state=42, learning_rate=0.06, max_iter=350)),
+                ("ridge", Ridge(alpha=3.0, random_state=42)),
+                ("lasso", Lasso(alpha=0.001, random_state=42, max_iter=20000)),
+            ],
+            final_estimator=Ridge(alpha=1.0, random_state=42),
+            passthrough=True,
+            n_jobs=-1,
+        )
+        est, params, cv_score = fit_with(stacking)
+        candidates.append(("stack", est, params, cv_score))
     elif choice == "auto":
-        # Try all and pick best CV R²
+        # Try all (excluding stack to keep runtime moderate) and pick best CV R²
         for name, est, grid in [
             ("rf", RandomForestRegressor(random_state=42, n_jobs=-1), {
                 "model__n_estimators": [300, 400],
                 "model__max_depth": [12, 16, 20],
                 "model__min_samples_split": [2, 4],
+            }),
+            ("hgb", HistGradientBoostingRegressor(random_state=42), {
+                "model__learning_rate": [0.05, 0.07],
+                "model__max_depth": [None, 8],
+                "model__max_iter": [300, 400],
             }),
             ("linear", LinearRegression(), None),
             ("ridge", Ridge(random_state=42), {"model__alpha": [0.1, 1.0, 3.0, 10.0, 30.0, 100.0]}),
@@ -316,7 +346,7 @@ def train_and_save(
             est2, params, cv_score = fit_with(est, grid)
             candidates.append((name, est2, params, cv_score))
     else:
-        raise ValueError("--model must be one of: rf, linear, ridge, lasso, auto")
+        raise ValueError("--model must be one of: rf, linear, ridge, lasso, hgb, stack, auto")
 
     # Select best by cross-val R² (or fallback to first)
     best_name, best_estimator, best_params, best_cv = sorted(candidates, key=lambda x: x[3], reverse=True)[0]
@@ -358,7 +388,7 @@ def main():
     parser.add_argument("--no-kaggle", action="store_true", help="Disable Kaggle fallback download")
     parser.add_argument("--target", type=str, default="price", help="Name of target price column (default: price)")
     parser.add_argument("--no-fallback", action="store_true", help="Disable automatic Kaggle dataset substitution when target missing")
-    parser.add_argument("--model", type=str, default="auto", choices=["rf","linear","ridge","lasso","auto"], help="Which model to train/compare")
+    parser.add_argument("--model", type=str, default="auto", choices=["rf","linear","ridge","lasso","hgb","stack","auto"], help="Which model to train/compare")
     args = parser.parse_args()
 
     try:

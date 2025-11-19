@@ -137,11 +137,22 @@ def predict(csv_in, model_path, csv_out=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Car price prediction tool")
-    parser.add_argument("--csv", required=True, help="Input CSV file")
+    # Primary required argument
+    parser.add_argument("--csv", help="Input CSV file (alias: --input)")
+    # Aliases for user convenience
+    parser.add_argument("--input", help="Alias for --csv input file")
     parser.add_argument("--model", default="car_price_pipeline.joblib", help="Saved pipeline path")
-    parser.add_argument("--out", help="Output CSV path")
+    parser.add_argument("--out", help="Output CSV path (alias: --output)")
+    parser.add_argument("--output", help="Alias for --out output path")
     args = parser.parse_args()
-    predict(args.csv, args.model, args.out)
+
+    # Resolve aliases
+    csv_in = args.csv or args.input
+    if not csv_in:
+        parser.error("--csv (or --input) is required. Example: python predict_final.py --csv data/sample_input.csv")
+    out_path = args.out or args.output
+
+    predict(csv_in, args.model, out_path)
 
 
 if __name__ == "__main__":
